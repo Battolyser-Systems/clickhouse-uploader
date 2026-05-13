@@ -7,6 +7,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 
+# Create a ClickHouse client using the stored connection details.
+# This client is used for both querying existing rows and inserting new data.
 def connect():
     client = clickhouse_connect.get_client(
         host='xrm2j9axsy.germanywestcentral.azure.clickhouse.cloud',
@@ -17,31 +19,37 @@ def connect():
     return client
 
 
-def read_file(file_name, folder_path, exp_id, sub_exp_id, rep, sample_id):
+def read_ivium_file(file_name, folder_path, exp_id, sub_exp_id, rep, sample_id):
+    # Load a single Ivium CSV file and convert its contents into a DataFrame.
     file_path = os.path.join(folder_path, file_name)
     data = np.loadtxt(file_path, delimiter=',')
 
+    # Only process known experiment types based on the filename.
     if 'EIS' in file_name or 'CA' in file_name or 'CP' in file_name:
         df = pd.DataFrame(index=range(len(data)))
 
         if 'EIS' in file_name:
+            # Electrochemical impedance spectroscopy data columns.
             df["experiment"] = "EIS"
             df["real_impedance"] = data[:, 0]
             df["complex_impedance"] = data[:, 1]
             df["frequency"] = data[:, 2]
 
         elif 'CA' in file_name:
+            # Chronoamperometry data columns.
             df["experiment"] = "CA"
             df["step_time"] = data[:, 0]
             df["current"] = data[:, 1]
             df["voltage"] = data[:, 2]
 
         elif 'CP' in file_name:
+            # Chronopotentiometry data columns.
             df["experiment"] = "CP"
             df["step_time"] = data[:, 0]
             df["voltage"] = data[:, 1]
             df["current"] = data[:, 2]
 
+        # Attach metadata to every row in the file.
         df["experiment_id"] = exp_id
         df["sub_experiment_id"] = sub_exp_id
         df["repetition"] = rep
@@ -51,11 +59,13 @@ def read_file(file_name, folder_path, exp_id, sub_exp_id, rep, sample_id):
         df["timestamp"] = datetime.strptime(file_name.split("_")[1][0:6], "%y%m%d")
         return df
 
+    # Warn and skip files that do not match expected experiment types.
     messagebox.showwarning("Unsupported file", f"File {file_name} does not contain EIS, CA, or CP data. Skipping.")
     return pd.DataFrame()
 
 
 def process_folders(folder_data):
+    # Read existing records from ClickHouse so we avoid duplicate uploads.
     try:
         client = connect()
         rows = client.query("""SELECT DISTINCT file_name, experiment_id, sub_experiment_id, sample_id FROM battolyser.ivium_raw""").result_rows
@@ -64,6 +74,7 @@ def process_folders(folder_data):
         messagebox.showwarning("ClickHouse Warning", f"Could not connect to ClickHouse: {e}")
         existing_combos = set()
 
+    # Build an empty DataFrame with all expected columns for the combined upload.
     result_df = pd.DataFrame(columns=[
         "experiment_id",
         "sub_experiment_id",
@@ -89,10 +100,12 @@ def process_folders(folder_data):
         sample_id = folder_info['sample_id']
         folder_path = folder if os.path.isabs(folder) else os.path.join(os.getcwd(), folder)
 
+        # Skip non-existing directories and warn the user.
         if not os.path.isdir(folder_path):
             messagebox.showerror("Folder error", f"Folder does not exist: {folder_path}")
             continue
 
+        # Load only CSV files from the selected folder.
         files = [f for f in os.listdir(folder_path) if f.endswith('.csv')]
         files_sorted = sorted(
             files,
@@ -105,6 +118,7 @@ def process_folders(folder_data):
         for file_name in files_sorted:
             combo = (file_name, exp_id, sub_exp_id, sample_id)
             if combo in existing_combos:
+                # If the file metadata already exists, abort early to avoid duplicates.
                 messagebox.showwarning(
                     "Duplicate entry",
                     f"The combination already exists in ivium_raw:\n"
@@ -116,19 +130,21 @@ def process_folders(folder_data):
                 )
                 return None
 
-            df = read_file(file_name, folder_path, exp_id, sub_exp_id, rep, sample_id)
+            df = read_ivium_file(file_name, folder_path, exp_id, sub_exp_id, rep, sample_id)
             result_df = pd.concat([result_df, df], ignore_index=True)
 
     return result_df
 
 
 class ClickHouseUploaderApp:
+    # Main application class managing the Tkinter UI and upload workflow.
     def __init__(self, root):
         self.root = root
         self.root.title("ClickHouse Upload")
         self.root.geometry("900x600")
         self.root.resizable(True, True)
 
+        # Internal state tracking selected folders, metadata, and final result.
         self.folder_paths = []
         self.metadata_entries = []
         self.result_df = pd.DataFrame()
@@ -137,13 +153,16 @@ class ClickHouseUploaderApp:
         self.main_frame = ttk.Frame(self.root, padding=10)
         self.main_frame.pack(fill='both', expand=True)
 
+        # Start with the folder selection step.
         self.create_folder_selection_frame()
 
     def clear_main_frame(self):
+        # Remove all widgets from the main frame before redrawing a new step.
         for widget in self.main_frame.winfo_children():
             widget.destroy()
 
     def create_folder_selection_frame(self):
+        # Build the first screen where the user chooses input directories.
         self.clear_main_frame()
         ttk.Label(self.main_frame, text="Step 1: Select directories", font=(None, 14, 'bold')).pack(anchor='w', pady=(0, 10))
 
@@ -172,12 +191,14 @@ class ClickHouseUploaderApp:
         continue_button.pack(side='right')
 
     def add_folder(self):
+        # Let the user choose one folder and add it to the list.
         folder = filedialog.askdirectory(title="Select folder")
         if folder and folder not in self.folder_paths:
             self.folder_paths.append(folder)
             self.folder_listbox.insert('end', folder)
 
     def add_folders_from_parent(self):
+        # Let the user choose a parent directory and add selected subfolders.
         parent = filedialog.askdirectory(title="Select parent directory")
         if not parent:
             return
@@ -215,6 +236,7 @@ class ClickHouseUploaderApp:
         control_frame.pack(fill='x', padx=10, pady=(0, 10))
 
         def add_selected():
+            # Add only the selected folders from the chooser popup.
             selection = folder_listbox.curselection()
             for index in selection:
                 folder = subfolders[index]
@@ -227,6 +249,7 @@ class ClickHouseUploaderApp:
         ttk.Button(control_frame, text="Cancel", command=popup.destroy).pack(side='right', padx=(0, 10))
 
     def remove_selected_folder(self):
+        # Remove the currently highlighted folder from the selection.
         selection = self.folder_listbox.curselection()
         if not selection:
             return
@@ -239,12 +262,14 @@ class ClickHouseUploaderApp:
         self.folder_listbox.delete(0, 'end')
 
     def go_to_metadata(self):
+        # Move to metadata entry only when one or more folders are selected.
         if len(self.folder_paths) == 0:
             messagebox.showwarning("No folders", "Please add at least one folder before continuing.")
             return
         self.create_metadata_frame()
 
     def create_metadata_frame(self):
+        # Show a table where each selected folder gets experiment metadata.
         self.clear_main_frame()
         ttk.Label(self.main_frame, text="Step 2: Fill table data", font=(None, 14, 'bold')).pack(anchor='w', pady=(0, 10))
 
@@ -256,6 +281,7 @@ class ClickHouseUploaderApp:
         hscrollbar = ttk.Scrollbar(container, orient='horizontal', command=canvas.xview)
         scrollable_frame = ttk.Frame(canvas)
 
+        # Make the metadata table scrollable for many folders.
         scrollable_frame.bind(
             "<Configure>",
             lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
@@ -327,6 +353,7 @@ class ClickHouseUploaderApp:
         process_button.pack(side='right')
 
     def process_files(self):
+        # Validate all metadata fields and convert them into typed folder data.
         folder_data = []
         for row in self.metadata_entries:
             folder = row['folder']
@@ -350,7 +377,7 @@ class ClickHouseUploaderApp:
                 'sample_id': sample_id
             })
 
-        # Check for overlaps in experiment_id, sub_experiment_id, repetition, sample_id
+        # Ensure each metadata combination is unique to avoid processing the same sample twice.
         combos = {(item['experiment_id'], item['sub_experiment_id'], item['repetition'], item['sample_id']) for item in folder_data}
         if len(combos) < len(folder_data):
             messagebox.showerror("Validation error", "There are overlapping entries in experiment_id, sub_experiment_id, repetition, and sample_id. Please ensure all combinations are unique.")
@@ -359,12 +386,14 @@ class ClickHouseUploaderApp:
         self.folder_data = folder_data
         result = process_folders(folder_data)
         if result is None:
+            # If processing aborted due to duplicates or an error, return to the first step.
             self.create_folder_selection_frame()
             return
         self.result_df = result
         self.show_review_frame()
 
     def show_review_frame(self):
+        # Display a preview of the processed rows and allow the user to upload them.
         self.clear_main_frame()
         ttk.Label(self.main_frame, text="Step 3: Review and upload", font=(None, 14, 'bold')).pack(anchor='w', pady=(0, 10))
 
@@ -387,6 +416,7 @@ class ClickHouseUploaderApp:
         upload_button.pack(side='right')
 
     def upload_data(self):
+        # Upload the processed DataFrame to ClickHouse after confirmation.
         if self.result_df.empty:
             messagebox.showwarning("No data", "There is no data to upload.")
             return
@@ -409,6 +439,7 @@ class ClickHouseUploaderApp:
 
 
 def main():
+    # Launch the Tkinter application.
     root = tk.Tk()
     app = ClickHouseUploaderApp(root)
     root.mainloop()
