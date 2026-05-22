@@ -37,6 +37,13 @@ def read_arbin_fc_folder(folder):
         data_df["file_name"] = file
         data_df["experiment"] = name_split[2]
         data_df["temperature"] = name_split[5]
+
+        float_cols = [
+            col for col in data_df.select_dtypes(include=['float64', 'float32', 'float16']).columns
+        ]
+        if float_cols:
+            data_df[float_cols] = data_df[float_cols].astype('float32')
+
         folder_df = pd.concat([folder_df, data_df], ignore_index=True)
     return folder_df
 
