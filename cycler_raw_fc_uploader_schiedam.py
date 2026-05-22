@@ -29,7 +29,7 @@ def read_arbin_fc_folder(folder):
         data_df = pd.read_csv(file_path)
         name_split = file.replace(".CSV","").split("_")
         data_df["experiment_id"] = int(name_split[1])
-        data_df["sub_experiment_id"] = np.nan
+        data_df["sub_experiment_id"] = int(1)
         data_df["repetition"] = int(name_split[6])
         data_df["sample_id"] = name_split[3] + "_" + name_split[4]
         data_df["anode"] = name_split[3]
