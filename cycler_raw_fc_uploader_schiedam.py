@@ -1,4 +1,3 @@
-#%%
 import os
 import clickhouse_connect
 import pandas as pd
@@ -8,7 +7,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import datetime
 
-#%%
+
 # Create a ClickHouse client using the stored connection details.
 # This client is used for both querying existing rows and inserting new data.
 def connect():
@@ -20,31 +19,6 @@ def connect():
     )
     return client
 
-
-def read_arbin_fc_file(file_name, folder_path, exp_id, sub_exp_id, rep, sample_id):
-    # Load a single Arbin CSV file and convert its contents into a DataFrame.
-    file_path = os.path.join(folder_path, file_name)
-    data = np.loadtxt(file_path, delimiter=',')
-
-    # Only process known experiment types based on the filename.
-    if 'Wb' in file_name:
-        df = pd.DataFrame(index=range(len(data)))
-
-        # Attach metadata to every row in the file.
-        df["experiment_id"] = exp_id
-        df["sub_experiment_id"] = sub_exp_id
-        df["repetition"] = rep
-        df["sample_id"] = sample_id
-        df["file_name"] = file_name
-        df["experiment"] = "EIS"
-        return df
-
-    # Warn and skip files that do not match expected experiment types.
-    messagebox.showwarning("Unsupported file", f"File {file_name} does not contain EIS, CA, or CP data. Skipping.")
-    return pd.DataFrame()
-
-folder = r"C:\Users\CasHofman\Downloads\260413_5_Act_A2_C2_80C_1_2026_04_13_161532"
-
 def read_arbin_fc_folder(folder):
     files_to_process = sorted([f for f in os.listdir(folder) if "Wb" in f])
     folder_df = pd.DataFrame()
@@ -55,15 +29,13 @@ def read_arbin_fc_folder(folder):
         name_split = file.replace(".CSV","").split("_")
         data_df["experiment_id"] = int(name_split[1])
         data_df["sub_experiment_id"] = np.nan
-        data_df["repetition"] = int(name_split[np.argwhere(np.array(name_split) == 'Channel')[0][0]-1])
+        data_df["repetition"] = int(name_split[6])
         data_df["sample_id"] = name_split[3] + "_" + name_split[4]
         data_df["anode"] = name_split[3]
         data_df["cathode"] = name_split[4]
         data_df["file_name"] = file
         data_df["experiment"] = name_split[2]
         data_df["temperature"] = name_split[5]
-
-
         folder_df = pd.concat([folder_df, data_df], ignore_index=True)
     return folder_df
 
@@ -101,17 +73,85 @@ def clean_folder_df(folder_df):
     return folder_df
 
 
+def get_eis_directory(folder_path):
+    parent2 = os.path.dirname(os.path.dirname(folder_path))
+    return os.path.join(parent2, 'ACIM_EIS_data')
+
+
+def read_eis_for_folder(folder_path, folder_df):
+    folder_name = os.path.basename(folder_path)
+    eis_match = '_'.join(folder_name.split('_')[0:7])
+    eis_dir = get_eis_directory(folder_path)
+
+    if not os.path.isdir(eis_dir):
+        return None, f"EIS directory not found: {eis_dir}"
+
+    eis_candidates = sorted(
+        f for f in os.listdir(eis_dir)
+        if f.startswith(eis_match + '_') and f.lower().endswith('.csv')
+    )
+
+    if not eis_candidates:
+        return None, f"No matching EIS file found in {eis_dir} for prefix {eis_match}_"
+
+    eis_file = eis_candidates[0]
+    eis_file_path = os.path.join(eis_dir, eis_file)
+    eis_df = pd.read_csv(eis_file_path, index_col=False)
+
+    if eis_df.empty:
+        return None, f"Matched EIS file is empty: {eis_file_path}"
+
+    metadata = folder_df.iloc[0]
+    eis_df['folder_name'] = os.path.basename(folder_path) or folder_path
+    eis_df['experiment_id'] = metadata.get('experiment_id', np.nan)
+    eis_df['sub_experiment_id'] = metadata.get('sub_experiment_id', np.nan)
+    eis_df['repetition'] = metadata.get('repetition', np.nan)
+    eis_df['sample_id'] = metadata.get('sample_id', np.nan)
+    eis_df['anode'] = metadata.get('anode', np.nan)
+    eis_df['cathode'] = metadata.get('cathode', np.nan)
+    eis_df['experiment'] = metadata.get('experiment', np.nan)
+    eis_df['temperature'] = metadata.get('temperature', np.nan)
+    eis_df['file_name'] = eis_file
+
+    eis_df.rename(columns={
+        'Cycle_ID': 'cycle_index',
+        'step_ID': 'step_index',
+        'Frequency': 'frequency',
+        'OCV': 'voltage',
+        'Zreal': 'real_impedance',
+        'Zimg': 'complex_impedance',
+        'Zphz': 'phase',
+        'Zmod': 'modulus',
+        'AC_Amp_RMS': 'ac_amplitude_rms'
+    }, inplace=True)
+
+    for column in ['Channel_ID', 'EIS_Test_ID', 'EIS_Data_Point', 'Test_Time']:
+        if column in eis_df.columns:
+            eis_df.drop(columns=[column], inplace=True)
+
+    return eis_df, None
+
+
 def process_folders(folder_paths):
-    # Read existing records from ClickHouse so we avoid duplicate uploads.
+    # Read existing records from ClickHouse so we can validate experiment membership and avoid duplicate file uploads.
+    experiment_info_keys = set()
+    existing_file_names = set()
+    existing_eis_file_names = set()
     try:
         client = connect()
-        rows = client.query("""SELECT DISTINCT file_name, experiment_id, sample_id FROM battolyser.cycler_raw_fc""").result_rows
-        existing_combos = {(row[0], int(row[1]), str(row[2])) for row in rows}
+        rows = client.query("""SELECT DISTINCT experiment_id, sample_id, repetition FROM battolyser.experiment_info_fc""").result_rows
+        experiment_info_keys = {(int(row[0]), str(row[1]), int(row[2])) for row in rows}
+
+        rows = client.query("""SELECT DISTINCT file_name FROM battolyser.cycler_raw_fc""").result_rows
+        existing_file_names = {str(row[0]) for row in rows}
+
+        rows = client.query("""SELECT DISTINCT file_name FROM battolyser.eis_raw_fc""").result_rows
+        existing_eis_file_names = {str(row[0]) for row in rows}
     except Exception as e:
         messagebox.showwarning("ClickHouse Warning", f"Could not connect to ClickHouse: {e}")
-        existing_combos = set()
 
     all_folder_df = pd.DataFrame()
+    all_eis_df = pd.DataFrame()
     for folder in folder_paths:
         folder_path = folder if os.path.isabs(folder) else os.path.join(os.getcwd(), folder)
 
@@ -121,34 +161,78 @@ def process_folders(folder_paths):
             continue
 
         folder_df = read_arbin_fc_folder(folder_path)
+        if folder_df.empty:
+            messagebox.showwarning("Folder error", f"No data files found in {folder_path}")
+            continue
+
         folder_df["folder_name"] = os.path.basename(folder_path) or folder_path
         all_folder_df = pd.concat([all_folder_df, folder_df], ignore_index=True)
 
+        eis_df, error = read_eis_for_folder(folder_path, folder_df)
+        if error:
+            messagebox.showwarning("Missing EIS data", error)
+            return None
+        all_eis_df = pd.concat([all_eis_df, eis_df], ignore_index=True)
+
     if all_folder_df.empty:
-        return all_folder_df
+        return all_folder_df, all_eis_df
 
     cleaned_df = clean_folder_df(all_folder_df)
     cleaned_df["file_name"] = cleaned_df["file_name"].astype(str)
     cleaned_df["sample_id"] = cleaned_df["sample_id"].astype(str)
+    cleaned_df["repetition"] = cleaned_df["repetition"].astype(int)
 
-    duplicate_entries = {
-        (row["file_name"], int(row["experiment_id"]), str(row["sample_id"]))
-        for _, row in cleaned_df[["file_name", "experiment_id", "sample_id"]].drop_duplicates().iterrows()
-        if (row["file_name"], int(row["experiment_id"]), str(row["sample_id"])) in existing_combos
+    if not all_eis_df.empty:
+        all_eis_df["file_name"] = all_eis_df["file_name"].astype(str)
+        all_eis_df["sample_id"] = all_eis_df["sample_id"].astype(str)
+        all_eis_df["repetition"] = all_eis_df["repetition"].astype(int)
+
+    missing_experiment_info = {
+        (int(row["experiment_id"]), str(row["sample_id"]), int(row["repetition"]))
+        for _, row in cleaned_df[["experiment_id", "sample_id", "repetition"]].drop_duplicates().iterrows()
+        if (int(row["experiment_id"]), str(row["sample_id"]), int(row["repetition"])) not in experiment_info_keys
     }
 
-    if duplicate_entries:
+    duplicate_file_names = {
+        row["file_name"]
+        for _, row in cleaned_df[["file_name"]].drop_duplicates().iterrows()
+        if row["file_name"] in existing_file_names
+    }
+
+    duplicate_eis_file_names = {
+        row["file_name"]
+        for _, row in all_eis_df[["file_name"]].drop_duplicates().iterrows()
+        if row["file_name"] in existing_eis_file_names
+    }
+
+    if missing_experiment_info:
         details = "\n".join(
-            f"file_name={file_name}, experiment_id={exp_id}, sample_id={sample_id}"
-            for file_name, exp_id, sample_id in sorted(duplicate_entries)
+            f"experiment_id={exp_id}, sample_id={sample_id}, repetition={repetition}"
+            for exp_id, sample_id, repetition in sorted(missing_experiment_info)
         )
         messagebox.showwarning(
-            "Duplicate entry",
-            f"The following data already exists in cycler_raw_fc:\n{details}\nPlease select different folders or remove existing data."
+            "Missing experiment info",
+            f"The following experiment info entries were not found in battolyser.experiment_info_fc:\n{details}\nPlease verify the source data."
         )
         return None
 
-    return cleaned_df
+    if duplicate_file_names:
+        details = "\n".join(sorted(duplicate_file_names))
+        messagebox.showwarning(
+            "Duplicate file name",
+            f"The following file_name entries already exist in cycler_raw_fc:\n{details}\nPlease select different folders or remove existing data."
+        )
+        return None
+
+    if duplicate_eis_file_names:
+        details = "\n".join(sorted(duplicate_eis_file_names))
+        messagebox.showwarning(
+            "Duplicate EIS file name",
+            f"The following file_name entries already exist in eis_raw_fc:\n{details}\nPlease select different folders or remove existing data."
+        )
+        return None
+
+    return cleaned_df, all_eis_df
 
 
 class ClickHouseUploaderApp:
@@ -161,6 +245,7 @@ class ClickHouseUploaderApp:
 
         self.folder_paths = []
         self.result_df = pd.DataFrame()
+        self.eis_result_df = pd.DataFrame()
         self.summary_df = pd.DataFrame()
 
         self.main_frame = ttk.Frame(self.root, padding=10)
@@ -279,9 +364,11 @@ class ClickHouseUploaderApp:
             messagebox.showwarning("No folders", "Please add at least one folder before processing.")
             return
 
-        self.result_df = process_folders(self.folder_paths)
-        if self.result_df is None:
+        result = process_folders(self.folder_paths)
+        if result is None:
             return
+
+        self.result_df, self.eis_result_df = result
         if self.result_df.empty:
             messagebox.showwarning("No data", "No data was found in the selected folders.")
             return
@@ -293,38 +380,69 @@ class ClickHouseUploaderApp:
         if df.empty:
             return pd.DataFrame(columns=[
                 "folder_name",
+                "cycler_file_name",
+                "eis_file_name",
                 "experiment_id",
                 "repetition",
                 "sample_id",
-                "anode",
-                "cathode",
-                "file_name",
                 "experiment",
                 "temperature"
             ])
 
-        summary = (
-            df.groupby(
-                [
-                    "folder_name",
-                    "experiment_id",
-                    "repetition",
-                    "sample_id",
-                    "anode",
-                    "cathode",
-                    "experiment",
-                    "temperature"
-                ], dropna=False, as_index=False
-            )["file_name"]
-            .agg(lambda names: "\n".join(sorted(pd.unique(names))))
+        eis_by_folder = (
+            self.eis_result_df
+            .drop_duplicates(subset=["folder_name", "file_name"])
+            .groupby("folder_name", dropna=False)["file_name"]
+            .agg(lambda names: sorted(pd.unique(names)))
+            .to_dict()
         )
-        return summary
+
+        summary_rows = []
+        group_keys = [
+            "folder_name",
+            "experiment_id",
+            "repetition",
+            "sample_id",
+            "experiment",
+            "temperature"
+        ]
+
+        grouped = df.groupby(group_keys, dropna=False)
+        for group_values, group_df in grouped:
+            folder_name = group_values[0]
+            cycler_files = sorted(pd.unique(group_df["file_name"]))
+            eis_files = eis_by_folder.get(folder_name, [])
+            eis_file_name = eis_files[0] if eis_files else ""
+
+            for index, cycler_file in enumerate(cycler_files):
+                row = {
+                    "folder_name": folder_name,
+                    "cycler_file_name": cycler_file,
+                    "eis_file_name": eis_file_name,
+                    "experiment_id": group_values[1] if index == 0 else "",
+                    "repetition": group_values[2] if index == 0 else "",
+                    "sample_id": group_values[3] if index == 0 else "",
+                    "experiment": group_values[4] if index == 0 else "",
+                    "temperature": group_values[5] if index == 0 else ""
+                }
+                summary_rows.append(row)
+
+        return pd.DataFrame(summary_rows, columns=[
+            "folder_name",
+            "cycler_file_name",
+            "eis_file_name",
+            "experiment_id",
+            "repetition",
+            "sample_id",
+            "experiment",
+            "temperature"
+        ])
 
     def show_review_frame(self):
         self.clear_main_frame()
         ttk.Label(self.main_frame, text="Step 2: Review and upload", font=(None, 14, 'bold')).pack(anchor='w', pady=(0, 10))
 
-        summary_text = f"Processed {len(self.result_df)} rows from {len(self.folder_paths)} folder(s)."
+        summary_text = f"Processed {len(self.result_df)} cycler rows from {len(self.folder_paths)} folder(s)."
         ttk.Label(self.main_frame, text=summary_text).pack(anchor='w', pady=(0, 10))
 
         table_frame = ttk.Frame(self.main_frame)
@@ -332,12 +450,11 @@ class ClickHouseUploaderApp:
 
         columns = [
             "folder_name",
+            "cycler_file_name",
+            "eis_file_name",
             "experiment_id",
             "repetition",
             "sample_id",
-            "anode",
-            "cathode",
-            "file_name",
             "experiment",
             "temperature"
         ]
@@ -378,9 +495,15 @@ class ClickHouseUploaderApp:
             client = connect()
             upload_df = self.result_df.drop(columns=['folder_name'], errors='ignore')
             client.insert_df('battolyser.cycler_raw_fc', upload_df)
+
+            if not self.eis_result_df.empty:
+                upload_eis_df = self.eis_result_df.drop(columns=['folder_name'], errors='ignore')
+                client.insert_df('battolyser.eis_raw_fc', upload_eis_df)
+
             messagebox.showinfo("Upload complete", "Data uploaded successfully.")
             self.folder_paths = []
             self.result_df = pd.DataFrame()
+            self.eis_result_df = pd.DataFrame()
             self.summary_df = pd.DataFrame()
             self.create_folder_selection_frame()
         except Exception as e:
@@ -398,4 +521,3 @@ if __name__ == '__main__':
     main()
 
 
-# %%
